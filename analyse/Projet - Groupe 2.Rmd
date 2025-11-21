@@ -1,0 +1,910 @@
+---
+title: "Projet de Groupe"
+author: "Sedanur - Mohand - Kilian - Damien - Oliwer"
+date: "2025-11-19"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 6)
+# Packages nécessaires
+packages <- c("readxl", "dplyr", "ggplot2", "tidyr", "scales", "jsonlite", "lubridate", "knitr", "kableExtra", "tidyverse", "rvest")
+installed <- packages %in% rownames(installed.packages())
+if(any(!installed)) install.packages(packages[!installed])
+lapply(packages, library, character.only = TRUE)
+options(stringsAsFactors = FALSE)
+```
+
+# Introduction
+
+Dans le cadre du projet, ce rapport présente une analyse approfondie des données de trafic aérien afin d'identifier les causes de dysfonctionnements et d'améliorer la fiabilité du service. 
+S'appuyant sur le croisement des jeux de données flights.xlsx, airlines.json, airports.xlsx et planes.html, cette étude s'articule autour de quatre axes majeurs :
+
+* Exploration et Inventaire : Cartographie du trafic, identification des acteurs clés (aéroports, compagnies, avions) et analyse de la couverture des destinations.
+* Dynamique Temporelle : Étude des cycles de trafic (mensuels, hebdomadaires) et identification des pics d'activité pour anticiper la saturation.
+* Analyse de la Performance et des Retards : Évaluation de la qualité de service via l'étude des retards au départ et à l'arrivée, calcul des gains de temps en vol (rattrapage) et analyse de la corrélation entre distance, heure de décollage et ponctualité.
+* Gestion des Aléas et Qualité des Données : Audit des données manquantes et analyse détaillée des volumes d'annulations par compagnie et par destination.
+
+Ce rapport vise à fournir une vision synthétique et actionnable pour accompagner la prise de décision stratégique.
+
+> Remarque : Ce rapport suppose que les fichiers `flights.xlsx` et `airlines.json` sont disponibles aux chemins suivants sur la machine locale :
+>
+> * `/Users/nano/Desktop/Exercice/Projet/Data/flights.xlsx`
+> * `/Users/nano/Desktop/Exercice/Projet/Data/airlines.json`
+> * `/Users/nano/Desktop/Exercice/Projet/Data/airports.xlsx`
+> * `/Users/nano/Desktop/Exercice/Projet/Data/planes.html`
+
+# 0. Lecture et préparation des données
+
+```{r}
+# --- lire les fichiers ---
+flights_path <- "/Users/nano/Desktop/Exercice/Projet/Data/flights.xlsx"
+airlines_path <- "/Users/nano/Desktop/Exercice/Projet/Data/airlines.json"
+airports_path <- "/Users/nano/Desktop/Exercice/Projet/Data/airports.xlsx"
+planes_path <- "/Users/nano/Desktop/Exercice/Projet/Data/planes.html"
+
+flights <- read_excel(flights_path)
+airports <- read_excel(airports_path)
+airlines <- fromJSON(airlines_path)
+planes <- read_html(planes_path) %>% 
+  html_table() %>% 
+  .[[1]]
+
+glimpse(flights)
+glimpse(airports)
+glimpse(airlines)
+glimpse(planes)
+```
+
+# 1. Statistiques et Exploration Générale
+
+## A. Inventaire du Trafic
+```{r}
+# Nombre total d'aéroports 
+total_airports <- unique(c(flights$origin, flights$dest)) %>% length()
+
+# Nombre de compagnies 
+total_airlines <- n_distinct(flights$carrier)
+
+# Nombre d'avions (tailnum uniques) 
+total_planes <- n_distinct(flights$tailnum, na.rm = TRUE)
+
+# Nombre de vols potentiellement annulés
+total_cancelled_simple <- sum(is.na(flights$dep_time))
+
+cat("Aéroports desservis :", total_airports, "\n")
+cat("Compagnies aériennes :", total_airlines, "\n")
+cat("Avions distincts :", total_planes, "\n")
+cat("Vols sans heure de départ :", total_cancelled_simple, "\n")
+```
+
+## B. Fuseaux Horaires
+```{r}
+# Aéroports ne respectant pas l'heure d'été (DST = 'N' pour None, souvent Arizona/Hawaii)
+airports_no_dst <- airports %>%
+  filter(dst == "N") %>%
+  nrow()
+
+# Nombre de fuseaux horaires distincts (colonne tzone)
+distinct_tz <- n_distinct(airports$tzone)
+
+cat("Aéroports sans DST ('N') :", airports_no_dst, "\n")
+cat("Nombre de fuseaux horaires distincts :", distinct_tz, "\n")
+```
+
+## C. Analyse du Trafic : Top et Flop
+### Aéroport de départ le plus emprunté
+```{r}
+top_origin <- flights %>%
+  count(origin, sort = TRUE) %>%
+  slice(1) %>%
+  left_join(airports, by = c("origin" = "faa")) %>%
+  select(origin, name, n)
+top_origin
+```
+
+### Top 10 des Destinations les plus prisées
+```{r}
+top_dest <- flights %>%
+  count(dest, sort = TRUE) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  slice_head(n = 10) %>%
+  left_join(airports, by = c("dest" = "faa")) %>%
+  select(dest, name, n, percentage)
+top_dest
+```
+
+### Top 10 des Destinations les moins prisées
+```{r}
+bottom_dest <- flights %>%
+  count(dest, sort = TRUE) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  slice_tail(n = 10) %>%
+  left_join(airports, by = c("dest" = "faa")) %>%
+  select(dest, name, n, percentage)
+bottom_dest
+```
+
+### Les 10 Avions les plus actifs
+```{r}
+top_planes <- flights %>%
+  filter(!is.na(tailnum)) %>%
+  count(tailnum, sort = TRUE) %>%
+  slice_head(n = 10)
+top_planes
+```
+
+## D. Couverture des Compagnies
+```{r}
+# Préparation des données
+dest_per_airline_origin <- flights %>%
+  group_by(origin, carrier) %>%
+  summarise(n_dest = n_distinct(dest), .groups = 'drop')
+
+# Graphique
+ggplot(dest_per_airline_origin, aes(x = carrier, y = n_dest, fill = origin)) +
+  geom_col(position = "dodge") +
+  labs(title = "Couverture : Nombre de destinations par compagnie et aéroport",
+       subtitle = "Comparaison entre EWR, JFK et LGA",
+       y = "Nombre de destinations", 
+       x = "Compagnie",
+       fill = "Aéroport Départ") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### Compagnies ne desservant pas l'ensemble des aéroports new-yorkais :
+```{r}
+# On compte combien d'aéroports d'origine distincts chaque compagnie utilise.
+# Si ce nombre est inférieur au nombre total d'aéroports d'origine (3 : JFK, LGA, EWR)
+total_origins <- n_distinct(flights$origin)
+
+airlines_partial_coverage <- flights %>%
+  group_by(carrier) %>%
+  summarise(n_origins_used = n_distinct(origin)) %>%
+  filter(n_origins_used < total_origins)
+airlines_partial_coverage
+```
+
+## E. Filtres Spécifiques
+### Vols vers Houston (IAH ou HOU) :
+```{r}
+nb_houston <- flights %>%
+  filter(dest %in% c("IAH", "HOU")) %>%
+  nrow()
+cat("Nombre total de vols vers Houston :", nb_houston)
+```
+
+```{r}
+flights_houston <- flights %>%
+  filter(dest %in% c("IAH", "HOU")) 
+flights_houston
+```
+
+### Statistiques de la liaison NYC -> Seattle (SEA) :
+```{r}
+nyc_sea_stats <- flights %>%
+  filter(dest == "SEA") %>%
+  summarise(
+    nb_vols = n(),
+    nb_compagnies = n_distinct(carrier),
+    nb_avions = n_distinct(tailnum)
+  )
+nyc_sea_stats
+```
+
+```{r}
+# Destinations exclusives à certaines compagnies
+exclusive_dest <- flights %>%
+  group_by(dest) %>%
+  distinct(dest, carrier) %>%
+  left_join(airports, by = c("dest" = "faa")) %>%
+  left_join(airlines, by = "carrier") %>%
+  select(Destination = dest, Compagnie = name.y) %>%
+  arrange(Destination)
+exclusive_dest
+```
+
+### Vols majeurs (UA, AA, DL) :
+```{r}
+nb_major <- flights %>%
+  filter(carrier %in% c("UA", "AA", "DL")) %>%
+  nrow()
+part_marche <- round(nb_major / nrow(flights) * 100, 1)
+cat("Les compagnies United, American et Delta représentent", 
+    nb_major, "vols, soit", part_marche, "% du trafic total.")
+```
+
+# 2. Analyse des Retards et Fiabilité
+
+## A. Reconstitution des Datetimes Complets
+```{r}
+# Convertit HHMM en datetime
+to_datetime <- function(year, month, day, time_col) {
+  time_str <- ifelse(is.na(time_col), NA, sprintf("%04d", time_col))
+  hour <- ifelse(is.na(time_str), NA_integer_, as.integer(substr(time_str, 1, 2)))
+  minute <- ifelse(is.na(time_str), NA_integer_, as.integer(substr(time_str, 3, 4)))
+  lubridate::make_datetime(
+    year  = year,
+    month = month,
+    day   = day,
+    hour  = hour,
+    min   = minute,
+    sec   = 0
+  )
+}
+
+flights2 <- flights %>%
+  mutate(
+    sched_dep_datetime = to_datetime(year, month, day, sched_dep_time),
+    dep_datetime       = to_datetime(year, month, day, dep_time),
+    arr_datetime       = to_datetime(year, month, day, arr_time),
+    sched_arr_datetime = to_datetime(year, month, day, sched_arr_time),
+    date = as_date(sched_dep_datetime)
+  ) %>%
+  select(
+    -year, -month, -day, -hour, -minute
+  )
+flights2["date"]
+``` 
+
+## B. Trafic Mensuel Normalisé (Vols/Jour) 
+```{r}
+daily_traffic <- flights2 %>%
+  group_by(origin, date) %>%
+  summarise(flights_per_day = n(), .groups = "drop")
+
+monthly_traffic <- daily_traffic %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(origin, month) %>%
+  summarise(
+    flights_total = sum(flights_per_day),
+    days_in_month = n_distinct(date),
+    flights_per_day_mean = flights_total / days_in_month,
+    .groups = "drop"
+  )
+
+origin_monthly_mean <- monthly_traffic %>%
+  group_by(origin) %>%
+  summarise(origin_mean_flights_per_day = mean(flights_per_day_mean))
+
+monthly_traffic <- monthly_traffic %>%
+  left_join(origin_monthly_mean, by = "origin")
+
+# Visualisation facettée
+p_monthly <- ggplot(monthly_traffic, aes(x = month, y = flights_per_day_mean)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(
+    data = origin_monthly_mean,
+    aes(yintercept = origin_mean_flights_per_day),
+    linetype = "dashed"
+  ) +
+  facet_wrap(~ origin, scales = "free_y") +
+  labs(
+    title = "Trafic mensuel normalisé (vols/jour) par aéroport d'origine",
+    x = "Mois",
+    y = "Vols moyens par jour"
+  ) +
+  theme_minimal()
+
+print(p_monthly)
+``` 
+
+## C. Taux d'Accroissement Mensuel 
+```{r}
+monthly_growth <- monthly_traffic %>%
+  arrange(origin, month) %>%
+  group_by(origin) %>%
+  mutate(
+    growth_rate = (flights_per_day_mean - lag(flights_per_day_mean)) /
+      lag(flights_per_day_mean)
+  ) %>%
+  ungroup()
+
+scale_factor <- 100
+
+p_monthly_growth <- ggplot(monthly_growth, aes(x = month)) +
+  geom_line(aes(y = flights_per_day_mean)) +
+  geom_point(aes(y = flights_per_day_mean)) +
+  geom_line(aes(y = growth_rate * scale_factor), linetype = "dotted") +
+  facet_wrap(~ origin, scales = "free_y") +
+  scale_y_continuous(
+    name = "Vols moyens par jour",
+    sec.axis = sec_axis(~ . / scale_factor, name = "Taux d'accroissement")
+  ) +
+  labs(title = "Trafic mensuel et taux de croissance") +
+  theme_minimal()
+
+print(p_monthly_growth)
+``` 
+
+## D. Weekend vs Jours Ouvrés
+```{r}
+weekly_traffic <- flights2 %>%
+  mutate(
+    wday = wday(date, week_start = 1),
+    day_type = if_else(wday %in% c(6, 7), "weekend", "weekday")
+  )
+
+daily_by_daytype <- weekly_traffic %>%
+  group_by(day_type, date) %>%
+  summarise(flights = n(), .groups = "drop")
+
+daytype_stats <- daily_by_daytype %>%
+  group_by(day_type) %>%
+  summarise(
+    mean_flights = mean(flights),
+    sd_flights = sd(flights)
+  )
+
+print(daytype_stats)
+
+p_weekday <- ggplot(daily_by_daytype, aes(x = date, y = flights, colour = day_type)) +
+  geom_line() +
+  theme_minimal() +
+  labs(
+    title = "Trafic quotidien : Weekend vs Jours ouvrés",
+    x = "Date",
+    y = "Nombre de vols"
+  )
+
+print(p_weekday)
+``` 
+
+## E. Jours Spéciaux vs Moyenne Annuelle 
+```{r}
+holidays_2021 <- as.Date(c(
+  "2021-01-01",
+  "2021-07-04",
+  "2021-11-25",
+  "2021-12-25"
+))
+
+flights_special <- flights2 %>%
+  mutate(is_special_day = date %in% holidays_2021)
+
+special_daily <- flights_special %>%
+  group_by(is_special_day, date) %>%
+  summarise(flights = n(), .groups = "drop")
+
+special_stats <- special_daily %>%
+  group_by(is_special_day) %>%
+  summarise(mean_flights = mean(flights))
+
+print(special_stats)
+
+annual_mean <- flights2 %>%
+  group_by(date) %>%
+  summarise(flights = n()) %>%
+  summarise(annual_mean = mean(flights))
+
+print(annual_mean)
+``` 
+
+# F. Top 3 Aéroports
+```{r}
+origin_counts <- flights2 %>% count(airport = origin, name = "n_origin")
+dest_counts   <- flights2 %>% count(airport = dest,   name = "n_dest")
+
+airport_traffic <- full_join(origin_counts, dest_counts, by = "airport") %>%
+  replace_na(list(n_origin = 0, n_dest = 0)) %>%
+  mutate(total_traffic = n_origin + n_dest)
+
+top3 <- airport_traffic %>%
+  arrange(desc(total_traffic)) %>%
+  slice_head(n = 3)
+
+print(top3)
+
+p_top3 <- ggplot(top3, aes(x = reorder(airport, total_traffic), y = total_traffic)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 3 des aéroports par trafic", x = "Aéroport", y = "Trafic total") +
+  theme_minimal()
+
+print(p_top3)
+```
+
+## G. Fonctions Utilitaires et Calculs de Retard (Gestion du Passage Minuit)
+```{r}
+# Convertir hhmm (ex: 524, 1330) en minutes depuis minuit
+hhmm_to_minutes <- function(time) {
+  time <- as.numeric(time)
+  hour <- floor(time / 100)
+  minute <- time %% 100
+  out <- hour * 60 + minute
+  out[is.na(time)] <- NA
+  return(out)
+}
+
+# Calcul des retards arr_delay et dep_delay (si dep_delay déjà présent, on l'utilise)
+# Pour arr_delay on recalcule à partir d'arr_time et 
+# sched_arr_time pour corriger passage minuit
+
+df2 <- flights %>%
+  mutate(
+    arr_time_min   = ifelse(is.na(arr_time), NA_real_, 
+                            hhmm_to_minutes(arr_time)),
+    sched_arr_min  = ifelse(is.na(sched_arr_time), NA_real_, 
+                            hhmm_to_minutes(sched_arr_time)),
+    dep_time_min   = ifelse(is.na(dep_time), NA_real_, 
+                            hhmm_to_minutes(dep_time)),
+    sched_dep_min  = ifelse(is.na(sched_dep_time), NA_real_, 
+                            hhmm_to_minutes(sched_dep_time))
+  ) %>%
+  rowwise() %>%
+  mutate(
+    arr_delay_calc = if(any(is.na(c(arr_time_min, sched_arr_min)))) NA_real_ else {
+      delta <- arr_time_min - sched_arr_min
+      if(delta < -720) delta <- delta + 1440
+      if(delta > 720) delta <- delta - 1440
+      delta
+    },
+    dep_delay_calc = if(!is.na(dep_delay)) dep_delay 
+    else if(any(is.na(c(dep_time_min, sched_dep_min)))) NA_real_ else {
+      delta2 <- dep_time_min - sched_dep_min
+      if(delta2 < -720) delta2 <- delta2 + 1440
+      if(delta2 > 720) delta2 <- delta2 - 1440
+      delta2
+    }
+  ) %>%
+  ungroup()
+
+# Remplacer les colonnes arr_delay/dep_delay originales par les calculées 
+# si plus cohérentes
+df2 <- df2 %>%
+  rename(arr_delay_raw = arr_delay, dep_delay_raw = dep_delay) %>%
+  mutate(
+    arr_delay = arr_delay_calc,
+    dep_delay = dep_delay_calc
+  ) %>%
+  select(-arr_time_min, -sched_arr_min, -dep_time_min, -sched_dep_min, 
+         -arr_delay_calc, -dep_delay_calc)
+
+# Joindre les informations compagnies
+if(!("carrier" %in% names(airlines))) {
+  names(airlines) <- c("carrier", "name")[1:ncol(airlines)]
+}
+
+df2 <- df2 %>% left_join(airlines, by = "carrier")
+
+cat("Données préparées — lignes:", nrow(df2), "\n")
+```
+
+## H. Table "master" avec Indicateurs de Retard, Gain et Rattrapage
+```{r}
+df_master <- df2 %>%
+  mutate(
+    delayed_arr = ifelse(is.na(arr_delay), NA, arr_delay > 0),
+    delayed_dep = ifelse(is.na(dep_delay), NA, dep_delay > 0),
+    early_arr   = ifelse(is.na(arr_delay), NA, arr_delay < 0),
+    early_dep   = ifelse(is.na(dep_delay), NA, dep_delay < 0),
+    gain_vol    = ifelse(is.na(dep_delay) | is.na(arr_delay), NA, dep_delay - arr_delay),
+    # gain_per_hour = gain en minutes divisé par air_time en heures
+    gain_per_hour = ifelse(is.na(gain_vol) | is.na(air_time) | 
+                             air_time <= 0, NA, gain_vol / (air_time/60)),
+    rattrape    = ifelse(is.na(arr_delay) | is.na(dep_delay), NA, arr_delay < dep_delay)
+  )
+
+# Petite vérification pour voir si les valeurs sont cohérentes et 
+# supprimer les valeurs extremes
+summary(select(df_master, arr_delay, dep_delay, gain_vol, gain_per_hour, air_time))
+```
+
+## I. Filtrage des Valeurs Aberrantes
+```{r}
+# Filtrage raisonnable pour les analyses graphiques
+df_filtered <- df_master %>%
+  filter(!is.na(arr_delay), !is.na(dep_delay),
+         arr_delay >= -30, arr_delay <= 1440,  # tolérer quelques cas extrêmes
+         dep_delay >= -30, dep_delay <= 1440,
+         !is.na(distance), distance > 0,
+         !is.na(air_time), air_time > 0)
+
+cat("Après filtrage — lignes:", nrow(df_filtered), "\n")
+```
+
+## J. Fiabilité/Régularité par Compagnie (Tableau et Ranking)
+```{r}
+fiabilite <- df_filtered %>%
+  group_by(carrier, name) %>%
+  summarise(
+    n = n(),
+    prop_delayed_arr = mean(delayed_arr, na.rm = TRUE),
+    prop_delayed_dep = mean(delayed_dep, na.rm = TRUE),
+    prop_early_arr   = mean(early_arr, na.rm = TRUE),
+    prop_early_dep   = mean(early_dep, na.rm = TRUE),
+    mean_arr_delay   = mean(arr_delay, na.rm = TRUE),
+    sd_arr_delay     = sd(arr_delay, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_arr_delay)
+
+# Affichage
+fiabilite %>% head(20) %>% kable(digits = 2) %>% kable_styling(full_width = FALSE)
+
+# Classement par retard moyen croissant
+fiabilite_ranked <- fiabilite %>% arrange(mean_arr_delay)
+```
+
+## K. Efficacité du Vol (le Temps de Rattrapage de Retard)
+```{r}
+efficacite <- df_filtered %>%
+  group_by(carrier, name) %>%
+  summarise(
+    n = n(),
+    mean_gain_vol   = mean(gain_vol, na.rm = TRUE),
+    median_gain_vol = median(gain_vol, na.rm = TRUE),
+    sd_gain_vol     = sd(gain_vol, na.rm = TRUE),
+    mean_gain_per_h = mean(gain_per_hour, na.rm = TRUE),
+    prop_vol_rattrape = mean(rattrape, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_gain_vol))
+
+# Table
+kable(efficacite %>% head(20), digits = 2) %>% kable_styling(full_width = FALSE)
+```
+
+## L. Visualisations — Classement & Distribution
+
+### Boxplot des Retards à l'Arrivée par Compagnie (Valeurs Raisonnables)
+```{r}
+# On restreint aux compagnies avec au moins un seuil minimal d'observations 
+# pour lisibilité
+min_obs <- 100
+top_companies <- fiabilite %>% filter(n >= min_obs) %>% arrange(mean_arr_delay) %>% 
+  pull(name)
+
+p1 <- ggplot(df_filtered %>% filter(name %in% top_companies), 
+             aes(x = reorder(name, arr_delay, FUN = median), y = arr_delay)) +
+  geom_boxplot(outlier.colour = "red", fill = "lightblue") +
+  labs(title = "Distribution des retards à l'arrivée par compagnie (>= n obs)", 
+       x = "Compagnie", y = "Retard à l'arrivée (minutes)") +
+  theme_minimal() +
+  coord_flip()
+
+print(p1)
+```
+
+### Barplot : Proportion Vols Retardés vs en Avance (par Compagnie)
+```{r}
+fiabilite_plot <- fiabilite %>% filter(n >= min_obs) %>%
+  select(name, prop_delayed_arr, prop_early_arr) %>%
+  pivot_longer(cols = c(prop_delayed_arr, prop_early_arr), names_to = "type", 
+               values_to = "proportion")
+
+p2 <- ggplot(fiabilite_plot, aes(x = reorder(name, proportion), 
+                                 y = proportion, fill = type)) +
+  geom_col(position = "dodge") +
+  labs(title = "Proportion de vols en retard ou en avance par compagnie", 
+       x = "Compagnie", y = "Proportion") +
+  scale_fill_manual(values = c("prop_delayed_arr" = "#d73027", 
+                               "prop_early_arr" = "#1a9850"), 
+                    labels = c("Retard", "Avance")) +
+  theme_minimal() +
+  coord_flip()
+
+print(p2)
+```
+
+### Scatter : Retard Moyen vs Gain Moyen (par Compagnie)
+```{r}
+plot_df <- fiabilite %>% select(carrier, name, mean_arr_delay) %>%
+  left_join(efficacite %>% select(carrier, mean_gain_vol), by = "carrier") %>%
+  distinct()
+
+p3 <- ggplot(plot_df, aes(x = mean_arr_delay, y = mean_gain_vol, label = carrier)) +
+  geom_point(size = 4) +
+  geom_text(nudge_y = 1.5) +
+  labs(title = "Retard moyen vs Gain moyen en vol par compagnie", 
+       x = "Retard moyen à l'arrivée (minutes)", y = "Gain moyen en vol (minutes)") +
+  theme_minimal()
+
+print(p3)
+```
+
+## M. Calculs de Gain et Identification des Vols ayant Rattrapé le Retard
+```{r}
+# Vols qui ont rattrapé : arr_delay < dep_delay (gain_vol positif)
+vols_rattrape <- df_filtered %>% filter(!is.na(gain_vol) & gain_vol > 0 & gain_vol < 1000)
+cat("Nombre de vols qui ont rattrapé leur retard:", nrow(vols_rattrape), "\n")
+
+# Top 10 vols qui ont le plus rattrapé
+vols_rattrape %>% arrange(desc(gain_vol)) %>% 
+  select(year, month, day, carrier, flight, origin, dest, dep_delay, 
+         arr_delay, gain_vol, gain_per_hour, air_time) %>% 
+  head(10) %>% kable(digits = 1) %>% kable_styling()
+```
+
+## N. Relation Distance - Retard par destination
+```{r}
+# Calcul par destination
+dest_stats <- df_filtered %>%
+  group_by(dest) %>%
+  summarise(
+    n = n(),
+    mean_arr_delay = mean(arr_delay, na.rm = TRUE),
+    sd_arr_delay   = sd(arr_delay, na.rm = TRUE),
+    mean_distance  = mean(distance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Identifier HNL (si présent) et vérifier valeurs extrêmes
+dest_stats %>% arrange(desc(mean_distance)) %>% head(10) %>% kable(digits = 1) %>% 
+  kable_styling()
+
+# Exclure HNL si outlier présent
+if("HNL" %in% dest_stats$dest) {
+  dest_stats_noHNL <- dest_stats %>% filter(dest != "HNL")
+} else {
+  dest_stats_noHNL <- dest_stats
+}
+
+# Corrélation et regression
+cor_test <- cor.test(dest_stats_noHNL$mean_distance, dest_stats_noHNL$mean_arr_delay)
+lm1 <- lm(mean_arr_delay ~ mean_distance, data = dest_stats_noHNL)
+summary_lm1 <- summary(lm1)
+
+# Résumé
+cat("Nombre de destinations analysées:", nrow(dest_stats_noHNL), "\n")
+cat("Corrélation (Pearson) entre distance moyenne et retard moyen:", 
+    round(cor_test$estimate, 3),
+    " (p=", signif(cor_test$p.value, 3), ")\n")
+
+# Graphique scatter + trendline
+p4 <- ggplot(dest_stats_noHNL, aes(x = mean_distance, y = mean_arr_delay)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "Relation distance moyenne vs retard moyen à l'arrivée (par destination)", 
+       x = "Distance moyenne (miles)", y = "Retard moyen à l'arrivée (minutes)") +
+  theme_minimal()
+
+print(p4)
+
+# Afficher résumé du modèle
+summary_lm1
+```
+
+## O. Quel est l'Aéroport avec le Retard Moyen le plus Faible ?
+```{r}
+# On récupère le meilleur, puis on joint avec la table 'airports' pour avoir le nom
+best_dest <- dest_stats %>% 
+  arrange(mean_arr_delay) %>% 
+  slice(1) %>%
+  left_join(airports, by = c("dest" = "faa")) # <-- C'est ici qu'on récupère le nom
+
+# Affichage du tableau avec le nom
+best_dest %>% 
+  select(Code = dest, Aéroport = name, Vols = n, Retard_Moyen = mean_arr_delay) %>%
+  knitr::kable(digits = 2, caption = "L'aéroport de destination le plus fiable") %>% 
+  kableExtra::kable_styling()
+
+# Affichage du texte avec le nom complet
+cat("Aéroport avec le retard moyen le plus faible :", best_dest$name, 
+    "(", best_dest$dest, ")\n",
+    "Retard moyen =", round(best_dest$mean_arr_delay, 2), "min\n",
+    "Basé sur", best_dest$n, "vols.\n")
+```
+
+
+## P. Facteurs de Retard — Heure de Décollage vs Retard
+```{r}
+# Créer une variable heure de départ (0-23) et tranche horaire
+# dep_time peut être NA; on utilise dep_time (hhmm) converti déjà
+
+df_time <- df_filtered %>%
+  mutate(
+    dep_hour = floor((as.integer(dep_time) %/% 100) %% 24),
+    dep_hour = ifelse(is.na(dep_hour), NA, dep_hour),
+    dep_slot = case_when(
+      is.na(dep_hour) ~ NA_character_,
+      dep_hour >= 5 & dep_hour < 12 ~ "Matin",
+      dep_hour >= 12 & dep_hour < 17 ~ "Après-midi",
+      dep_hour >= 17 & dep_hour < 22 ~ "Soir",
+      TRUE ~ "Nuit"
+    )
+  )
+
+# Boxplot arr_delay par heure
+p5 <- ggplot(df_time %>% filter(!is.na(dep_hour)), 
+             aes(x = factor(dep_hour), y = arr_delay)) +
+  geom_boxplot(outlier.size = 0.8) +
+  labs(title = "Retard à l'arrivée par heure de départ (0-23)", 
+       x = "Heure de départ (heure)", y = "Retard à l'arrivée (minutes)") +
+  theme_minimal()
+
+print(p5)
+
+# Moyennes par tranche horaire
+by_slot <- df_time %>% group_by(dep_slot) %>% summarise(n = n(), 
+                  mean_arr_delay = mean(arr_delay, na.rm = TRUE), 
+                  sd_arr_delay = sd(arr_delay, na.rm = TRUE), .groups = 'drop')
+by_slot %>% kable(digits = 2) %>% kable_styling()
+
+# Régression simple : arr_delay ~ dep_hour (modèle cyclique non pris en compte ici)
+lm2 <- lm(arr_delay ~ dep_hour, data = df_time %>% 
+            filter(!is.na(dep_hour) & !is.na(arr_delay)))
+summary(lm2)
+```
+
+## Q. Compagnies les Plus Retardés
+```{r}
+fiabilite_ranked %>%
+select(carrier, name, n, mean_arr_delay, prop_delayed_arr, sd_arr_delay) %>%
+head(10) %>%
+kable(digits = 2) %>% kable_styling()
+```
+
+## R. Analyse de l'Aéroport de Départ
+```{r}
+fiabilite_origin <- df_filtered %>%
+group_by(origin) %>%
+summarise(
+n = n(),
+mean_arr_delay = mean(arr_delay, na.rm = TRUE),
+sd_arr_delay   = sd(arr_delay, na.rm = TRUE),
+prop_delayed_dep = mean(dep_delay > 0, na.rm = TRUE),
+prop_delayed_arr = mean(arr_delay > 0, na.rm = TRUE),
+prop_early_arr   = mean(arr_delay < 0, na.rm = TRUE),
+.groups = "drop"
+) %>%
+arrange(mean_arr_delay)
+
+# Affichage
+
+fiabilite_origin %>%
+kable(digits = 2) %>%
+kable_styling(full_width = FALSE)
+```
+
+## S. Analyse de Fiabilité par Aéroport d’Arrivée
+```{r}
+fiabilite_dest <- df_filtered %>%
+group_by(dest) %>%
+summarise(
+n = n(),
+mean_arr_delay = mean(arr_delay, na.rm = TRUE),
+sd_arr_delay   = sd(arr_delay, na.rm = TRUE),
+prop_delayed_arr = mean(arr_delay > 0, na.rm = TRUE),
+prop_early_arr   = mean(arr_delay < 0, na.rm = TRUE),
+mean_distance    = mean(distance, na.rm = TRUE),
+.groups = "drop"
+) %>%
+arrange(mean_arr_delay)
+
+# Affichage
+
+fiabilite_dest %>%
+kable(digits = 2) %>%
+kable_styling(full_width = FALSE)
+```
+
+## U. Couple Aéroport de Départ/Aéroport d'Arrivée
+```{r}
+couples_retards <- df_filtered %>%
+group_by(origin, dest) %>%
+summarise(
+n = n(),
+mean_arr_delay = mean(arr_delay, na.rm = TRUE),
+sd_arr_delay = sd(arr_delay, na.rm = TRUE),
+prop_delayed = mean(arr_delay > 0, na.rm = TRUE),
+.groups = "drop"
+) %>%
+
+filter(n >= 30) %>%
+arrange(desc(mean_arr_delay))
+
+couples_retards %>%
+head(15) %>%
+kable(digits = 2) %>%
+kable_styling(full_width = FALSE)
+```
+```{r 12-conclusions, echo=FALSE}
+top20_dest <- df_filtered %>%
+group_by(dest) %>%
+summarise(n_vols = n(), .groups = "drop") %>%
+arrange(desc(n_vols)) %>%
+slice_head(n = 20) %>%
+pull(dest)
+
+couples_retards_top20 <- couples_retards %>%
+filter(dest %in% top20_dest)
+
+ggplot(couples_retards_top20, aes(x = dest, y = origin, fill = mean_arr_delay)) +
+geom_tile() +
+scale_fill_viridis_c() +
+theme_minimal() +
+labs(
+title = "Retard moyen d’arrivée par couple (top 20 aéroports d’arrivée)",
+x = "Aéroport d’arrivée",
+y = "Aéroport de départ",
+fill = "Retard moyen (min)"
+) +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## V. Nombre de Vols avec au moins 2h de Retard
+```{r}
+strict_cases <- df_master %>%
+filter(!is.na(arr_delay), !is.na(dep_delay)) %>%
+filter(arr_delay > 120,
+dep_delay <= 0)
+
+cat("Vols arrivés avec >2h de retard mais partis à l'heure:", nrow(strict_cases), "\n")
+```
+
+# 3. Analyse des Annulations et Données Manquantes
+
+## A. Audits des Données Manquantes
+### Calcul de la proportion de NA pour les variables critiques
+```{r}
+missing_stats <- flights %>%
+  summarise(
+    na_dep_time = mean(is.na(dep_time)),
+    na_dep_delay = mean(is.na(dep_delay)),
+    na_arr_time = mean(is.na(arr_time)),
+    na_arr_delay = mean(is.na(arr_delay))
+  ) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "taux_na")
+
+missing_stats
+```
+
+### Identification des autres colonnes concernées par les manquants
+```{r}
+col_na_counts <- colSums(is.na(flights))
+col_na_counts[col_na_counts > 0]
+```
+
+## B. Analyse des Vols Annulés
+### Définition : Un vol est annulé si dep_time ET arr_time sont manquants
+```{r}
+cancelled_flights <- flights %>%
+  filter(is.na(dep_time) & is.na(arr_time))
+
+# Nombre total
+nb_cancelled <- nrow(cancelled_flights)
+print(paste("Nombre total de vols annulés :", nb_cancelled))
+```
+
+### Affinage par Destination & Compagnie
+```{r}
+# Top 5 des destinations subissant le plus d'annulations
+cancelled_flights %>%
+  count(dest, sort = TRUE) %>%
+  head(5) %>%
+  left_join(airports, by = c("dest" = "faa")) %>%
+  select(Destination = dest, Ville = name, Annulations = n) %>%
+  knitr::kable(caption = "Top 5 Destinations : Les plus touchées par les annulations") %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+
+# Classement par Compagnie
+cancelled_by_carrier <- cancelled_flights %>%
+  count(carrier, sort = TRUE) %>%
+  left_join(airlines, by = "carrier") %>%
+  select(Code = carrier, Compagnie = name, Annulations = n)
+
+cancelled_by_carrier
+```
+
+### Visualisation des Annulations par Compagnie
+```{r}
+cancelled_flights %>%
+  count(carrier, sort = TRUE) %>%
+  left_join(airlines, by = "carrier") %>%
+  ggplot(aes(x = reorder(name, n), y = n)) +
+  geom_col(fill = "firebrick") +
+  coord_flip() +
+  labs(
+    title = "Nombre de vols annulés par Compagnie Aérienne",
+    subtitle = "Critère : Heures de départ et d'arrivée manquantes",
+    x = "Compagnie",
+    y = "Nombre d'annulations"
+  ) +
+  theme_minimal()
+```
+---
